@@ -75,6 +75,11 @@ type NodeResourcesFitArgs struct {
 	// +listType=atomic
 	IgnoredResourceGroups []string `json:"ignoredResourceGroups,omitempty"`
 
+	// ScoreAllResources, when set to true, makes all resources defined in ScoringStrategy.Resources
+	// participate in scoring even if the pod doesn't request them. The pod's request for
+	// unrequested resources is treated as 0.
+	ScoreAllResources bool `json:"scoreAllResources,omitempty"`
+
 	// ScoringStrategy selects the node resource scoring strategy.
 	// The default strategy is LeastAllocated with an equal "cpu" and "memory" weight.
 	ScoringStrategy *ScoringStrategy `json:"scoringStrategy,omitempty"`

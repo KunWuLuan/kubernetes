@@ -37,14 +37,15 @@ import (
 
 func TestMostAllocatedScoringStrategy(t *testing.T) {
 	tests := []struct {
-		name           string
-		requestedPod   *v1.Pod
-		nodes          []*v1.Node
-		existingPods   []*v1.Pod
-		expectedScores fwk.NodeScoreList
-		resources      []config.ResourceSpec
-		wantErrs       field.ErrorList
-		wantStatusCode fwk.Code
+		name              string
+		requestedPod      *v1.Pod
+		nodes             []*v1.Node
+		existingPods      []*v1.Pod
+		expectedScores    fwk.NodeScoreList
+		resources         []config.ResourceSpec
+		scoreAllResources bool
+		wantErrs          field.ErrorList
+		wantStatusCode    fwk.Code
 	}{
 		{
 			// Node1 scores (used resources) on 0-MaxNodeScore scale
@@ -301,6 +302,25 @@ func TestMostAllocatedScoringStrategy(t *testing.T) {
 			expectedScores: []fwk.NodeScore{{Name: "node1", Score: 50}, {Name: "node2", Score: 50}},
 		},
 		{
+			// Score all resources even if the pod does not request the extended resource.
+			// For node1: cpuScore = 50, memScore = 50. node1 does not have extended resource, so it's skipped.
+			// node1 Score: (50 + 50) / 2 = 50
+			// For node2: cpuScore = 50, memScore = 50, extResScore = (0 * 100) / 4 = 0
+			// node2 Score: (50 + 50 + 0) / 3 = 33
+			name: "score all resources even if the pod does not request",
+			requestedPod: st.MakePod().
+				Req(map[v1.ResourceName]string{"cpu": "1000", "memory": "2000"}).
+				Req(map[v1.ResourceName]string{"cpu": "2000", "memory": "3000"}).
+				Obj(),
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{"cpu": "6000", "memory": "10000"}).Obj(),
+				st.MakeNode().Name("node2").Capacity(map[v1.ResourceName]string{"cpu": "6000", "memory": "10000", v1.ResourceName(extendedRes): "4"}).Obj(),
+			},
+			expectedScores:    []fwk.NodeScore{{Name: "node1", Score: 50}, {Name: "node2", Score: 33}},
+			resources:         extendedResourceSet,
+			scoreAllResources: true,
+		},
+		{
 			// Honor extended resource if the pod requests.
 			// For both nodes: cpuScore and memScore are 50.
 			// In terms of extended resource score:
@@ -356,6 +376,7 @@ func TestMostAllocatedScoringStrategy(t *testing.T) {
 
 			p, err := NewFit(ctx,
 				&config.NodeResourcesFitArgs{
+					ScoreAllResources: test.scoreAllResources,
 					ScoringStrategy: &config.ScoringStrategy{
 						Type:      config.MostAllocated,
 						Resources: test.resources,

@@ -58,10 +58,13 @@ type resourceAllocationScorer struct {
 	// used to decide whether to use Requested or NonZeroRequested for
 	// cpu and memory.
 	useRequested bool
-	scorer       func(requested, allocated, allocatable []int64) int64
-	resources    []config.ResourceSpec
-	draFeatures  structured.Features
-	draManager   fwk.SharedDRAManager
+	// scoreAllResources, when true, makes all configured resources participate
+	// in scoring even if the pod doesn't request them.
+	scoreAllResources bool
+	scorer            func(requested, allocated, allocatable []int64) int64
+	resources         []config.ResourceSpec
+	draFeatures       structured.Features
+	draManager        fwk.SharedDRAManager
 	// Caches for DRA-related computations
 	DRACaches
 }
@@ -156,8 +159,9 @@ func (r *resourceAllocationScorer) score(
 	for i := range r.resources {
 		resource := v1.ResourceName(r.resources[i].Name)
 		// If it's an extended resource, and the pod doesn't request it.
-		// We don't fill the resource entry as an implication to bypass scoring on it.
-		if podRequests[i] == 0 && schedutil.IsScalarResourceName(resource) {
+		// We don't fill the resource entry as an implication to bypass scoring on it,
+		// unless scoreAllResources is enabled.
+		if !r.scoreAllResources && podRequests[i] == 0 && schedutil.IsScalarResourceName(resource) {
 			continue
 		}
 		nodeAllocatable, nodeAllocated := r.calculateResourceAllocatableRequest(ctx, nodeInfo, resource, draPreScoreState)

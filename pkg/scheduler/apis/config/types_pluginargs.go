@@ -75,6 +75,10 @@ type NodeResourcesFitArgs struct {
 	// A resource group name can't contain '/'.
 	IgnoredResourceGroups []string
 
+	// ScoreAllResources, when set to true, makes all resources defined in ScoringStrategy.Resources
+	// participate in scoring even if the pod doesn't request them.
+	ScoreAllResources bool
+
 	// ScoringStrategy selects the node resource scoring strategy.
 	ScoringStrategy *ScoringStrategy
 }

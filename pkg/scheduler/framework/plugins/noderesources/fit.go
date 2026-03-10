@@ -65,25 +65,28 @@ var nodeResourceStrategyTypeMap = map[config.ScoringStrategyType]scorer{
 	config.LeastAllocated: func(args *config.NodeResourcesFitArgs) *resourceAllocationScorer {
 		resources := args.ScoringStrategy.Resources
 		return &resourceAllocationScorer{
-			Name:      string(config.LeastAllocated),
-			scorer:    leastResourceScorer(resources),
-			resources: resources,
+			Name:              string(config.LeastAllocated),
+			scorer:            leastResourceScorer(resources),
+			resources:         resources,
+			scoreAllResources: args.ScoreAllResources,
 		}
 	},
 	config.MostAllocated: func(args *config.NodeResourcesFitArgs) *resourceAllocationScorer {
 		resources := args.ScoringStrategy.Resources
 		return &resourceAllocationScorer{
-			Name:      string(config.MostAllocated),
-			scorer:    mostResourceScorer(resources),
-			resources: resources,
+			Name:              string(config.MostAllocated),
+			scorer:            mostResourceScorer(resources),
+			resources:         resources,
+			scoreAllResources: args.ScoreAllResources,
 		}
 	},
 	config.RequestedToCapacityRatio: func(args *config.NodeResourcesFitArgs) *resourceAllocationScorer {
 		resources := args.ScoringStrategy.Resources
 		return &resourceAllocationScorer{
-			Name:      string(config.RequestedToCapacityRatio),
-			scorer:    requestedToCapacityRatioScorer(resources, args.ScoringStrategy.RequestedToCapacityRatio.Shape),
-			resources: resources,
+			Name:              string(config.RequestedToCapacityRatio),
+			scorer:            requestedToCapacityRatioScorer(resources, args.ScoringStrategy.RequestedToCapacityRatio.Shape),
+			resources:         resources,
+			scoreAllResources: args.ScoreAllResources,
 		}
 	},
 }

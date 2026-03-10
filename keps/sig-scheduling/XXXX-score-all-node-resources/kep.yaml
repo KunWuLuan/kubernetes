@@ -1,0 +1,29 @@
+title: Score All Node Resources
+kep-number: XXXX
+authors:
+  - "@KunWuLuan"
+owning-sig: sig-scheduling
+status: provisional
+creation-date: 2026-03-06
+reviewers:
+  - TBD
+approvers:
+  - TBD
+see-also:
+  - "/keps/sig-scheduling/1258-default-pod-topology-spread"
+
+stage: alpha
+latest-milestone: "v1.33"
+milestone:
+  alpha: "v1.33"
+  beta: "v1.34"
+  stable: "v1.35"
+
+feature-gates:
+  - name: ScoreAllNodeResources
+    components:
+      - kube-scheduler
+disable-supported: true
+
+metrics:
+  - scheduler_plugin_execution_duration_seconds

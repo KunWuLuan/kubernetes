@@ -610,6 +610,7 @@ func Convert_config_NodeResourcesBalancedAllocationArgs_To_v1_NodeResourcesBalan
 func autoConvert_v1_NodeResourcesFitArgs_To_config_NodeResourcesFitArgs(in *configv1.NodeResourcesFitArgs, out *config.NodeResourcesFitArgs, s conversion.Scope) error {
 	out.IgnoredResources = *(*[]string)(unsafe.Pointer(&in.IgnoredResources))
 	out.IgnoredResourceGroups = *(*[]string)(unsafe.Pointer(&in.IgnoredResourceGroups))
+	out.ScoreAllResources = in.ScoreAllResources
 	out.ScoringStrategy = (*config.ScoringStrategy)(unsafe.Pointer(in.ScoringStrategy))
 	return nil
 }
@@ -622,6 +623,7 @@ func Convert_v1_NodeResourcesFitArgs_To_config_NodeResourcesFitArgs(in *configv1
 func autoConvert_config_NodeResourcesFitArgs_To_v1_NodeResourcesFitArgs(in *config.NodeResourcesFitArgs, out *configv1.NodeResourcesFitArgs, s conversion.Scope) error {
 	out.IgnoredResources = *(*[]string)(unsafe.Pointer(&in.IgnoredResources))
 	out.IgnoredResourceGroups = *(*[]string)(unsafe.Pointer(&in.IgnoredResourceGroups))
+	out.ScoreAllResources = in.ScoreAllResources
 	out.ScoringStrategy = (*configv1.ScoringStrategy)(unsafe.Pointer(in.ScoringStrategy))
 	return nil
 }
