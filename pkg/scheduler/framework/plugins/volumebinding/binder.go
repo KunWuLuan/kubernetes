@@ -26,6 +26,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -546,7 +547,7 @@ func (b *volumeBinder) bindAPIUpdate(ctx context.Context, pod *v1.Pod, bindings 
 	for _, binding = range bindings {
 		// TODO: does it hurt if we make an api call and nothing needs to be updated?
 		logger.V(5).Info("Updating PersistentVolume: binding to claim", "pod", klog.KObj(pod), "PV", klog.KObj(binding.pv), "PVC", klog.KObj(binding.pvc))
-		newPV, err := b.kubeClient.CoreV1().PersistentVolumes().Update(ctx, binding.pv, metav1.UpdateOptions{})
+		newPV, err := b.updatePVClaimRef(ctx, logger, binding.pv)
 		if err != nil {
 			logger.V(4).Info("Updating PersistentVolume: binding to claim failed", "pod", klog.KObj(pod), "PV", klog.KObj(binding.pv), "PVC", klog.KObj(binding.pvc), "err", err)
 			return err
@@ -562,7 +563,7 @@ func (b *volumeBinder) bindAPIUpdate(ctx context.Context, pod *v1.Pod, bindings 
 	// PV controller is expected to signal back by removing related annotations if actual provisioning fails
 	for i, claim = range claimsToProvision {
 		logger.V(5).Info("Updating claims objects to trigger volume provisioning", "pod", klog.KObj(pod), "PVC", klog.KObj(claim))
-		newClaim, err := b.kubeClient.CoreV1().PersistentVolumeClaims(claim.Namespace).Update(ctx, claim, metav1.UpdateOptions{})
+		newClaim, err := b.updateClaimSelectedNode(ctx, logger, claim)
 		if err != nil {
 			logger.V(4).Info("Updating PersistentVolumeClaim: binding to volume failed", "PVC", klog.KObj(claim), "err", err)
 			return err
@@ -574,6 +575,212 @@ func (b *volumeBinder) bindAPIUpdate(ctx context.Context, pod *v1.Pod, bindings 
 	}
 
 	return nil
+}
+
+const (
+	// maxWriteConflictRetries is the maximum number of retries of a binding
+	// update that lost a resource version race with another writer.
+	maxWriteConflictRetries = 3
+	// writeConflictRetryBaseDelay is the base delay between retries; it is
+	// multiplied by the retry number (100ms, 200ms, ...).
+	writeConflictRetryBaseDelay = 100 * time.Millisecond
+)
+
+// updatePVClaimRef writes the assumed claimRef (and the
+// bound-by-controller annotation) of a static binding to the API server.
+//
+// A resource version conflict is retried by rebasing the intended fields onto
+// the latest PV, but only when the concurrent changes cannot have influenced
+// the scheduling decision: metadata-only changes are absorbed. Any spec
+// change, phase change, rebinding to a different claim, or deletion aborts
+// the update so the pod is rescheduled - the same outcome as without the
+// retry. Aborting is required because the PV was chosen for the pod based on
+// the old object, e.g. its node affinity or capacity.
+func (b *volumeBinder) updatePVClaimRef(ctx context.Context, logger klog.Logger, assumed *v1.PersistentVolume) (*v1.PersistentVolume, error) {
+	newPV, err := b.kubeClient.CoreV1().PersistentVolumes().Update(ctx, assumed, metav1.UpdateOptions{})
+	if err == nil || !apierrors.IsConflict(err) {
+		return newPV, err
+	}
+	if assumed.Spec.ClaimRef == nil {
+		// Nothing specific to rebase, keep the conflict error.
+		return nil, err
+	}
+
+	logger.V(2).Info("PersistentVolume update conflicted, rebasing onto the latest object", "PV", klog.KObj(assumed), "retries", maxWriteConflictRetries)
+	for retry := 1; retry <= maxWriteConflictRetries; retry++ {
+		if retry > 1 {
+			if sleepErr := sleepWithContext(ctx, writeConflictRetryBaseDelay*time.Duration(retry-1)); sleepErr != nil {
+				return nil, sleepErr
+			}
+		}
+
+		live, err := b.kubeClient.CoreV1().PersistentVolumes().Get(ctx, assumed.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		if abortErr := pvConflictAbortReason(assumed, live); abortErr != nil {
+			metrics.WriteConflictRetryTotal.WithLabelValues("pv", "aborted").Inc()
+			return nil, abortErr
+		}
+		if claimRefsMatch(live.Spec.ClaimRef, assumed.Spec.ClaimRef) {
+			// The claimRef is already in place, e.g. left over from a
+			// previous attempt of this pod on the same node. There is
+			// nothing to write.
+			metrics.WriteConflictRetryTotal.WithLabelValues("pv", "idempotent").Inc()
+			return live, nil
+		}
+
+		rebased := live.DeepCopy()
+		rebased.Spec.ClaimRef = assumed.Spec.ClaimRef.DeepCopy()
+		if metav1.HasAnnotation(assumed.ObjectMeta, volume.AnnBoundByController) &&
+			!metav1.HasAnnotation(rebased.ObjectMeta, volume.AnnBoundByController) {
+			metav1.SetMetaDataAnnotation(&rebased.ObjectMeta, volume.AnnBoundByController, "yes")
+		}
+
+		newPV, err = b.kubeClient.CoreV1().PersistentVolumes().Update(ctx, rebased, metav1.UpdateOptions{})
+		if err == nil {
+			metrics.WriteConflictRetryTotal.WithLabelValues("pv", "success").Inc()
+			logger.V(2).Info("PersistentVolume update succeeded after rebase", "PV", klog.KObj(newPV), "retries", retry)
+			return newPV, nil
+		}
+		if !apierrors.IsConflict(err) {
+			return nil, err
+		}
+	}
+
+	metrics.WriteConflictRetryTotal.WithLabelValues("pv", "exhausted").Inc()
+	return nil, fmt.Errorf("PersistentVolume %q update conflicted %d times, giving up", assumed.Name, maxWriteConflictRetries+1)
+}
+
+// pvConflictAbortReason checks whether a concurrently updated PV can still be
+// prebound to the assumed claim. It returns nil if only fields that cannot
+// influence the scheduling decision have changed, and an error explaining why
+// the update must abort otherwise.
+func pvConflictAbortReason(assumed, live *v1.PersistentVolume) error {
+	if live.UID != assumed.UID {
+		return fmt.Errorf("PersistentVolume %q was deleted and recreated concurrently, aborting prebind", live.Name)
+	}
+	if live.DeletionTimestamp != nil {
+		return fmt.Errorf("PersistentVolume %q is being deleted, aborting prebind", live.Name)
+	}
+	if live.Spec.ClaimRef != nil && !claimRefsMatch(live.Spec.ClaimRef, assumed.Spec.ClaimRef) {
+		return fmt.Errorf("PersistentVolume %q got bound to another claim concurrently, aborting prebind", live.Name)
+	}
+	// Compare the specs without the claimRef, which is the field this update
+	// intends to write.
+	assumedSpec, liveSpec := assumed.Spec, live.Spec
+	assumedSpec.ClaimRef, liveSpec.ClaimRef = nil, nil
+	if !apiequality.Semantic.DeepEqual(&assumedSpec, &liveSpec) {
+		return fmt.Errorf("PersistentVolume %q spec changed concurrently, aborting prebind", live.Name)
+	}
+	if live.Status.Phase != v1.VolumeAvailable {
+		return fmt.Errorf("PersistentVolume %q is in phase %q instead of %q, aborting prebind", live.Name, live.Status.Phase, v1.VolumeAvailable)
+	}
+	return nil
+}
+
+// updateClaimSelectedNode writes the selected-node annotation that triggers
+// and topologically constrains dynamic provisioning of the claim.
+//
+// A resource version conflict is retried by rebasing the annotation onto the
+// latest claim, but only when the concurrent changes cannot have influenced
+// the scheduling decision: metadata-only changes are absorbed. Any spec or
+// status change, an annotation selecting a different node (the claim is being
+// provisioned for another pod or scheduler), or deletion aborts the update so
+// the pod is rescheduled - the same outcome as without the retry. Aborting is
+// required because the node was chosen for the pod based on the old claim,
+// e.g. its storage class, size, or access modes.
+func (b *volumeBinder) updateClaimSelectedNode(ctx context.Context, logger klog.Logger, assumed *v1.PersistentVolumeClaim) (*v1.PersistentVolumeClaim, error) {
+	newClaim, err := b.kubeClient.CoreV1().PersistentVolumeClaims(assumed.Namespace).Update(ctx, assumed, metav1.UpdateOptions{})
+	if err == nil || !apierrors.IsConflict(err) {
+		return newClaim, err
+	}
+	selectedNode, hasIntent := assumed.Annotations[volume.AnnSelectedNode]
+	if !hasIntent {
+		// Nothing specific to rebase, keep the conflict error.
+		return nil, err
+	}
+
+	logger.V(2).Info("PersistentVolumeClaim update conflicted, rebasing onto the latest object", "PVC", klog.KObj(assumed), "retries", maxWriteConflictRetries)
+	for retry := 1; retry <= maxWriteConflictRetries; retry++ {
+		if retry > 1 {
+			if sleepErr := sleepWithContext(ctx, writeConflictRetryBaseDelay*time.Duration(retry-1)); sleepErr != nil {
+				return nil, sleepErr
+			}
+		}
+
+		live, err := b.kubeClient.CoreV1().PersistentVolumeClaims(assumed.Namespace).Get(ctx, assumed.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		if live.UID != assumed.UID {
+			metrics.WriteConflictRetryTotal.WithLabelValues("pvc", "aborted").Inc()
+			return nil, fmt.Errorf("PersistentVolumeClaim %q was deleted and recreated concurrently, aborting provisioning update", klog.KObj(live))
+		}
+		if live.DeletionTimestamp != nil {
+			metrics.WriteConflictRetryTotal.WithLabelValues("pvc", "aborted").Inc()
+			return nil, fmt.Errorf("PersistentVolumeClaim %q is being deleted, aborting provisioning update", klog.KObj(live))
+		}
+		if !apiequality.Semantic.DeepEqual(live.Spec, assumed.Spec) {
+			metrics.WriteConflictRetryTotal.WithLabelValues("pvc", "aborted").Inc()
+			return nil, fmt.Errorf("PersistentVolumeClaim %q spec changed concurrently, aborting provisioning update", klog.KObj(live))
+		}
+		if !apiequality.Semantic.DeepEqual(live.Status, assumed.Status) {
+			metrics.WriteConflictRetryTotal.WithLabelValues("pvc", "aborted").Inc()
+			return nil, fmt.Errorf("PersistentVolumeClaim %q status changed concurrently, aborting provisioning update", klog.KObj(live))
+		}
+		if node, exists := live.Annotations[volume.AnnSelectedNode]; exists {
+			if node != selectedNode {
+				metrics.WriteConflictRetryTotal.WithLabelValues("pvc", "aborted").Inc()
+				return nil, fmt.Errorf("PersistentVolumeClaim %q is being provisioned for node %q instead of %q, aborting provisioning update", klog.KObj(live), node, selectedNode)
+			}
+			// The annotation is already in place, e.g. left over from a
+			// previous attempt of this pod on the same node. There is
+			// nothing to write.
+			metrics.WriteConflictRetryTotal.WithLabelValues("pvc", "idempotent").Inc()
+			return live, nil
+		}
+
+		rebased := live.DeepCopy()
+		metav1.SetMetaDataAnnotation(&rebased.ObjectMeta, volume.AnnSelectedNode, selectedNode)
+
+		newClaim, err = b.kubeClient.CoreV1().PersistentVolumeClaims(assumed.Namespace).Update(ctx, rebased, metav1.UpdateOptions{})
+		if err == nil {
+			metrics.WriteConflictRetryTotal.WithLabelValues("pvc", "success").Inc()
+			logger.V(2).Info("PersistentVolumeClaim update succeeded after rebase", "PVC", klog.KObj(newClaim), "retries", retry)
+			return newClaim, nil
+		}
+		if !apierrors.IsConflict(err) {
+			return nil, err
+		}
+	}
+
+	metrics.WriteConflictRetryTotal.WithLabelValues("pvc", "exhausted").Inc()
+	return nil, fmt.Errorf("PersistentVolumeClaim %q update conflicted %d times, giving up", klog.KObj(assumed), maxWriteConflictRetries+1)
+}
+
+// claimRefsMatch reports whether ref points to the same claim as the assumed
+// claimRef, ignoring the claim's resource version which may have changed
+// since the reference was created.
+func claimRefsMatch(ref, assumedRef *v1.ObjectReference) bool {
+	if ref == nil || assumedRef == nil {
+		return false
+	}
+	return ref.Name == assumedRef.Name &&
+		ref.Namespace == assumedRef.Namespace &&
+		ref.UID == assumedRef.UID
+}
+
+// sleepWithContext waits for d, or returns early if ctx is done.
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 var (

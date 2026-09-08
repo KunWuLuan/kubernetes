@@ -45,6 +45,18 @@ var (
 		},
 		[]string{"operation"},
 	)
+	// WriteConflictRetryTotal tracks the outcome of PV/PVC binding update
+	// retries after a resource version conflict. Only conflicts that were
+	// actually retried are counted; the first, non-conflicting update is not.
+	WriteConflictRetryTotal = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      VolumeSchedulerSubsystem,
+			Name:           "write_conflict_retry_total",
+			Help:           "Total number of PV/PVC binding update retries after a resource version conflict, by object kind and outcome (success, idempotent, aborted, exhausted)",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"object", "outcome"},
+	)
 )
 
 // RegisterVolumeSchedulingMetrics is used for scheduler, because the volume binding cache is a library
@@ -52,4 +64,5 @@ var (
 func RegisterVolumeSchedulingMetrics() {
 	legacyregistry.MustRegister(VolumeBindingRequestSchedulerBinderCache)
 	legacyregistry.MustRegister(VolumeSchedulingStageFailed)
+	legacyregistry.MustRegister(WriteConflictRetryTotal)
 }

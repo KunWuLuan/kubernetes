@@ -18,9 +18,11 @@ package volumebinding
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,8 +30,11 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
@@ -2108,6 +2113,316 @@ func TestBindPodVolumes(t *testing.T) {
 		}
 		if scenario.shouldFail && err == nil {
 			t.Error("returned success but expected error")
+		}
+	}
+
+	for name, scenario := range scenarios {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			run(t, scenario)
+		})
+	}
+}
+
+func TestUpdateClaimSelectedNodeConflictRetry(t *testing.T) {
+	conflict := apierrors.NewConflict(schema.GroupResource{Resource: "persistentvolumeclaims"}, "provisioned-pvc", errors.New("concurrent update"))
+
+	// concurrentLabelUpdate simulates a writer that changed nothing relevant
+	// to scheduling: it only added a label. The resource version is bumped
+	// because the apiserver assigns a new one to every update.
+	concurrentLabelUpdate := func(pvc *v1.PersistentVolumeClaim) *v1.PersistentVolumeClaim {
+		live := pvc.DeepCopy()
+		live.ResourceVersion = "2"
+		live.Labels = map[string]string{"concurrent-writer": "true"}
+		return live
+	}
+
+	type scenarioType struct {
+		assumed     *v1.PersistentVolumeClaim // object the binder tries to write
+		live        *v1.PersistentVolumeClaim // API state after the concurrent update that caused the conflict; nil if none
+		conflicts   int                       // number of update attempts that fail with 409
+		firstErr    error                     // non-409 error returned by the first update
+		wantErr     string                    // expected error substring; empty means success
+		wantUpdates int                       // expected number of update API calls
+		wantNode    string                    // expected selected-node annotation on the final claim
+	}
+
+	scenarios := map[string]scenarioType{
+		"update-succeeds-without-conflict": {
+			assumed:     pvcSetSelectedNode(provisionedPVC, "node1"),
+			wantUpdates: 1,
+			wantNode:    "node1",
+		},
+		"conflict-absorbs-harmless-label": {
+			assumed:     pvcSetSelectedNode(provisionedPVC, "node1"),
+			live:        concurrentLabelUpdate(provisionedPVC),
+			conflicts:   1,
+			wantUpdates: 2,
+			wantNode:    "node1",
+		},
+		"conflict-aborts-on-spec-change": {
+			assumed: pvcSetSelectedNode(provisionedPVC, "node1"),
+			live: func() *v1.PersistentVolumeClaim {
+				live := concurrentLabelUpdate(provisionedPVC)
+				live.Spec.Resources.Requests[v1.ResourceStorage] = resource.MustParse("2Gi")
+				return live
+			}(),
+			conflicts:   1,
+			wantErr:     "spec changed concurrently",
+			wantUpdates: 1,
+		},
+		"conflict-aborts-on-other-selected-node": {
+			assumed: pvcSetSelectedNode(provisionedPVC, "node1"),
+			live: func() *v1.PersistentVolumeClaim {
+				live := concurrentLabelUpdate(provisionedPVC)
+				metav1.SetMetaDataAnnotation(&live.ObjectMeta, volume.AnnSelectedNode, "node2")
+				return live
+			}(),
+			conflicts:   1,
+			wantErr:     "is being provisioned for node",
+			wantUpdates: 1,
+			// The concurrent writer's annotation must survive; our own write
+			// for node1 must not land on top of it.
+			wantNode: "node2",
+		},
+		"conflict-idempotent-when-already-set": {
+			assumed: pvcSetSelectedNode(provisionedPVC, "node1"),
+			live: func() *v1.PersistentVolumeClaim {
+				live := concurrentLabelUpdate(provisionedPVC)
+				metav1.SetMetaDataAnnotation(&live.ObjectMeta, volume.AnnSelectedNode, "node1")
+				return live
+			}(),
+			conflicts:   1,
+			wantUpdates: 1,
+			wantNode:    "node1",
+		},
+		"conflict-aborts-on-uid-change": {
+			assumed: pvcSetSelectedNode(provisionedPVC, "node1"),
+			live: func() *v1.PersistentVolumeClaim {
+				live := concurrentLabelUpdate(provisionedPVC)
+				live.UID = "different-uid"
+				return live
+			}(),
+			conflicts:   1,
+			wantErr:     "deleted and recreated",
+			wantUpdates: 1,
+		},
+		"conflict-aborts-on-deletion": {
+			assumed: pvcSetSelectedNode(provisionedPVC, "node1"),
+			live: func() *v1.PersistentVolumeClaim {
+				live := concurrentLabelUpdate(provisionedPVC)
+				now := metav1.Now()
+				live.DeletionTimestamp = &now
+				return live
+			}(),
+			conflicts:   1,
+			wantErr:     "is being deleted",
+			wantUpdates: 1,
+		},
+		"conflict-retries-are-bounded": {
+			assumed:     pvcSetSelectedNode(provisionedPVC, "node1"),
+			live:        concurrentLabelUpdate(provisionedPVC),
+			conflicts:   100,
+			wantErr:     "conflicted 4 times",
+			wantUpdates: 4,
+		},
+		"non-conflict-error-is-not-retried": {
+			assumed:     pvcSetSelectedNode(provisionedPVC, "node1"),
+			firstErr:    apierrors.NewBadRequest("etcd is on fire"),
+			wantErr:     "etcd is on fire",
+			wantUpdates: 1,
+		},
+	}
+
+	run := func(t *testing.T, scenario scenarioType) {
+		logger, ctx := ktesting.NewTestContext(t)
+		testEnv := newTestBinder(t, ctx)
+		testEnv.initClaims(t, nil, []*v1.PersistentVolumeClaim{provisionedPVC})
+
+		var updateCalls int
+		testEnv.client.(*fake.Clientset).PrependReactor("update", "persistentvolumeclaims", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+			updateCalls++
+			if scenario.firstErr != nil && updateCalls == 1 {
+				return true, nil, scenario.firstErr
+			}
+			if updateCalls <= scenario.conflicts {
+				if scenario.live != nil {
+					testEnv.reactor.AddClaim(scenario.live)
+				}
+				return true, nil, conflict
+			}
+			return false, nil, nil
+		})
+
+		newClaim, err := testEnv.internalBinder.updateClaimSelectedNode(ctx, logger, scenario.assumed)
+
+		if scenario.wantErr == "" && err != nil {
+			t.Errorf("returned error: %v", err)
+		}
+		if scenario.wantErr != "" && (err == nil || !strings.Contains(err.Error(), scenario.wantErr)) {
+			t.Errorf("expected error containing %q, got: %v", scenario.wantErr, err)
+		}
+		if updateCalls != scenario.wantUpdates {
+			t.Errorf("expected %d update calls, got %d", scenario.wantUpdates, updateCalls)
+		}
+		if err == nil && newClaim == nil {
+			t.Error("expected a returned claim on success")
+		}
+
+		final, getErr := testEnv.client.CoreV1().PersistentVolumeClaims("testns").Get(ctx, "provisioned-pvc", metav1.GetOptions{})
+		if getErr != nil {
+			t.Fatalf("failed to get final claim: %v", getErr)
+		}
+		if got := final.Annotations[volume.AnnSelectedNode]; got != scenario.wantNode {
+			t.Errorf("expected selected-node annotation %q on the final claim, got %q", scenario.wantNode, got)
+		}
+		if scenario.live != nil && final.Labels["concurrent-writer"] != "true" {
+			t.Error("expected the concurrent writer's label to be preserved on the final claim")
+		}
+	}
+
+	for name, scenario := range scenarios {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			run(t, scenario)
+		})
+	}
+}
+
+func TestUpdatePVClaimRefConflictRetry(t *testing.T) {
+	conflict := apierrors.NewConflict(schema.GroupResource{Resource: "persistentvolumes"}, "pv-node1a", errors.New("concurrent update"))
+
+	// pvWithLabel simulates a writer that changed nothing relevant to
+	// scheduling: it only added a label. The resource version is bumped
+	// because the apiserver assigns a new one to every update.
+	pvWithLabel := func(pv *v1.PersistentVolume) *v1.PersistentVolume {
+		live := pv.DeepCopy()
+		live.ResourceVersion = "2"
+		live.Labels = map[string]string{"concurrent-writer": "true"}
+		return live
+	}
+
+	type scenarioType struct {
+		assumed     *v1.PersistentVolume // object the binder tries to write
+		live        *v1.PersistentVolume // API state after the concurrent update that caused the conflict; nil if none
+		conflicts   int                  // number of update attempts that fail with 409
+		firstErr    error                // non-409 error returned by the first update
+		wantErr     string               // expected error substring; empty means success
+		wantUpdates int                  // expected number of update API calls
+	}
+
+	scenarios := map[string]scenarioType{
+		"update-succeeds-without-conflict": {
+			assumed:     pvNode1aBound,
+			wantUpdates: 1,
+		},
+		"conflict-absorbs-harmless-label": {
+			assumed:     pvNode1aBound,
+			live:        pvWithLabel(pvNode1a),
+			conflicts:   1,
+			wantUpdates: 2,
+		},
+		"conflict-aborts-on-spec-change": {
+			assumed:     pvNode1aBound,
+			live:        pvWithLabel(makeTestPV("pv-node1a", "node1", "10G", "1", nil, waitClass)),
+			conflicts:   1,
+			wantErr:     "spec changed concurrently",
+			wantUpdates: 1,
+		},
+		"conflict-aborts-on-other-claim": {
+			assumed:     pvNode1aBound,
+			live:        pvWithLabel(makeTestPV("pv-node1a", "node1", "5G", "1", unboundPVC2, waitClass)),
+			conflicts:   1,
+			wantErr:     "bound to another claim",
+			wantUpdates: 1,
+		},
+		"conflict-idempotent-when-already-bound": {
+			assumed:     pvNode1aBound,
+			live:        pvWithLabel(makeTestPV("pv-node1a", "node1", "5G", "1", unboundPVC, waitClass)),
+			conflicts:   1,
+			wantUpdates: 1,
+		},
+		"conflict-aborts-on-phase-change": {
+			assumed: pvNode1aBound,
+			live: func() *v1.PersistentVolume {
+				live := pvWithLabel(pvNode1a)
+				live.Status.Phase = v1.VolumeReleased
+				return live
+			}(),
+			conflicts:   1,
+			wantErr:     "is in phase",
+			wantUpdates: 1,
+		},
+		"conflict-aborts-on-uid-change": {
+			assumed: pvNode1aBound,
+			live: func() *v1.PersistentVolume {
+				live := pvWithLabel(pvNode1a)
+				live.UID = "different-uid"
+				return live
+			}(),
+			conflicts:   1,
+			wantErr:     "deleted and recreated",
+			wantUpdates: 1,
+		},
+		"conflict-retries-are-bounded": {
+			assumed:     pvNode1aBound,
+			live:        pvWithLabel(pvNode1a),
+			conflicts:   100,
+			wantErr:     "conflicted 4 times",
+			wantUpdates: 4,
+		},
+		"non-conflict-error-is-not-retried": {
+			assumed:     pvNode1aBound,
+			firstErr:    apierrors.NewBadRequest("etcd is on fire"),
+			wantErr:     "etcd is on fire",
+			wantUpdates: 1,
+		},
+	}
+
+	run := func(t *testing.T, scenario scenarioType) {
+		logger, ctx := ktesting.NewTestContext(t)
+		testEnv := newTestBinder(t, ctx)
+		testEnv.initVolumes(t, nil, []*v1.PersistentVolume{pvNode1a})
+
+		var updateCalls int
+		testEnv.client.(*fake.Clientset).PrependReactor("update", "persistentvolumes", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+			updateCalls++
+			if scenario.firstErr != nil && updateCalls == 1 {
+				return true, nil, scenario.firstErr
+			}
+			if updateCalls <= scenario.conflicts {
+				if scenario.live != nil {
+					testEnv.reactor.AddVolume(scenario.live)
+				}
+				return true, nil, conflict
+			}
+			return false, nil, nil
+		})
+
+		newPV, err := testEnv.internalBinder.updatePVClaimRef(ctx, logger, scenario.assumed)
+
+		if scenario.wantErr == "" && err != nil {
+			t.Errorf("returned error: %v", err)
+		}
+		if scenario.wantErr != "" && (err == nil || !strings.Contains(err.Error(), scenario.wantErr)) {
+			t.Errorf("expected error containing %q, got: %v", scenario.wantErr, err)
+		}
+		if updateCalls != scenario.wantUpdates {
+			t.Errorf("expected %d update calls, got %d", scenario.wantUpdates, updateCalls)
+		}
+		if err == nil && newPV == nil {
+			t.Error("expected a returned PV on success")
+		}
+
+		final, getErr := testEnv.client.CoreV1().PersistentVolumes().Get(ctx, "pv-node1a", metav1.GetOptions{})
+		if getErr != nil {
+			t.Fatalf("failed to get final PV: %v", getErr)
+		}
+		if got := claimRefsMatch(final.Spec.ClaimRef, scenario.assumed.Spec.ClaimRef); got != (scenario.wantErr == "") {
+			t.Errorf("expected final claimRef pointing to the assumed claim=%v, got %v", scenario.wantErr == "", got)
+		}
+		if scenario.live != nil && final.Labels["concurrent-writer"] != "true" {
+			t.Error("expected the concurrent writer's label to be preserved on the final PV")
 		}
 	}
 
